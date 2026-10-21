@@ -13,7 +13,8 @@ import { createTogetherWorker } from "./netease/togetherWorker.js";
 import { InMemoryEventQueue } from "./queue.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
-const INGEST_TOKEN = process.env.BRIDGE_INGEST_TOKEN ?? "";
+const INGEST_TOKEN = process.env.BRIDGE_INGEST_TOKEN?.trim() ?? "";
+const MCP_ACCESS_TOKEN = process.env.MCP_ACCESS_TOKEN?.trim() ?? "";
 const UNIX_SOCKET = process.env.BRIDGE_UNIX_SOCKET?.trim() ?? "";
 const queue = new InMemoryEventQueue();
 const playbackState = new PlaybackStateStore();
@@ -61,8 +62,12 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   return body ? JSON.parse(body) : {};
 }
 
-function authorized(req: IncomingMessage): boolean {
-  return !INGEST_TOKEN || req.headers.authorization === `Bearer ${INGEST_TOKEN}`;
+function bearerAuthorized(req: IncomingMessage, token: string): boolean {
+  return Boolean(token) && req.headers.authorization === `Bearer ${token}`;
+}
+
+function ingestAuthorized(req: IncomingMessage): boolean {
+  return !INGEST_TOKEN || bearerAuthorized(req, INGEST_TOKEN);
 }
 
 export function createHttpServer() {
@@ -88,7 +93,7 @@ export function createHttpServer() {
       writeJson(res, 200, {
         ok: true,
         service: "cove-bridge",
-        version: "0.1.0",
+        version: "0.2.0",
         queue: queue.status(),
         listener: listenerWakeHub.status(),
       });
@@ -111,7 +116,7 @@ export function createHttpServer() {
     }
 
     if (req.method === "POST" && url.pathname === "/events") {
-      if (!authorized(req)) {
+      if (!ingestAuthorized(req)) {
         writeJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -137,6 +142,15 @@ export function createHttpServer() {
     const mcpMethods = new Set(["POST", "GET", "DELETE"]);
     const mcpProfile = MCP_PATHS.get(url.pathname);
     if (mcpProfile && mcpMethods.has(req.method)) {
+      if (!MCP_ACCESS_TOKEN) {
+        writeJson(res, 503, { error: "mcp_access_token_not_configured" });
+        return;
+      }
+      if (!bearerAuthorized(req, MCP_ACCESS_TOKEN)) {
+        res.setHeader("WWW-Authenticate", "Bearer");
+        writeJson(res, 401, { error: "unauthorized" });
+        return;
+      }
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
       const server = createMcpServer(queue, playbackState, togetherWorker, mcpProfile);
