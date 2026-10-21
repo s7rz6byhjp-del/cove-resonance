@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+const TEST_MCP_TOKEN = "test-only-mcp-token";
+
 async function withServer(run: (base: string) => Promise<void>): Promise<void> {
-  const previous = process.env.NODE_ENV;
+  const previousNodeEnv = process.env.NODE_ENV;
+  const previousToken = process.env.MCP_ACCESS_TOKEN;
   process.env.NODE_ENV = "test";
+  process.env.MCP_ACCESS_TOKEN = TEST_MCP_TOKEN;
   const { createHttpServer } = await import("../src/server.js");
-  if (previous === undefined) delete process.env.NODE_ENV;
-  else process.env.NODE_ENV = previous;
 
   const server = createHttpServer();
   await new Promise<void>((resolve, reject) => {
@@ -19,16 +21,28 @@ async function withServer(run: (base: string) => Promise<void>): Promise<void> {
     await run("http://127.0.0.1:" + address.port);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    if (previousToken === undefined) delete process.env.MCP_ACCESS_TOKEN;
+    else process.env.MCP_ACCESS_TOKEN = previousToken;
   }
 }
 
-async function rpc(base: string, path: string, id: number, method: string) {
-  const response = await fetch(base + path, {
+async function rpc(
+  base: string,
+  path: string,
+  id: number,
+  method: string,
+  token: string | null = TEST_MCP_TOKEN,
+) {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "accept": "application/json, text/event-stream",
+  };
+  if (token) headers.authorization = `Bearer ${token}`;
+  return await fetch(base + path, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "accept": "application/json, text/event-stream",
-    },
+    headers,
     body: JSON.stringify({
       jsonrpc: "2.0",
       id,
@@ -42,6 +56,10 @@ async function rpc(base: string, path: string, id: number, method: string) {
         : {},
     }),
   });
+}
+
+async function successfulRpc(base: string, path: string, id: number, method: string) {
+  const response = await rpc(base, path, id, method);
   assert.equal(response.status, 200, path + ":" + method);
   return await response.json() as {
     result?: {
@@ -52,10 +70,21 @@ async function rpc(base: string, path: string, id: number, method: string) {
   };
 }
 
-test("legacy /mcp and scoped /mcp/music both initialize", async () => {
+test("MCP endpoints reject missing or invalid bearer tokens", async () => {
   await withServer(async (base) => {
-    const legacy = await rpc(base, "/mcp", 1, "initialize");
-    const music = await rpc(base, "/mcp/music", 2, "initialize");
+    for (const path of ["/mcp", "/mcp/music"]) {
+      const missing = await rpc(base, path, 1, "initialize", null);
+      assert.equal(missing.status, 401, path + ":missing-token");
+      const invalid = await rpc(base, path, 2, "initialize", "wrong-token");
+      assert.equal(invalid.status, 401, path + ":invalid-token");
+    }
+  });
+});
+
+test("legacy /mcp and scoped /mcp/music both initialize with bearer auth", async () => {
+  await withServer(async (base) => {
+    const legacy = await successfulRpc(base, "/mcp", 3, "initialize");
+    const music = await successfulRpc(base, "/mcp/music", 4, "initialize");
     assert.equal(legacy.result?.serverInfo?.name, "cove-resonance");
     assert.equal(music.result?.serverInfo?.name, "cove-resonance-music");
   });
@@ -84,7 +113,7 @@ test("legacy and scoped endpoints both keep the Music V2 tool surface", async ()
   ];
   await withServer(async (base) => {
     for (const path of ["/mcp", "/mcp/music"]) {
-      const body = await rpc(base, path, 3, "tools/list");
+      const body = await successfulRpc(base, path, 5, "tools/list");
       const names = new Set((body.result?.tools ?? []).map((tool) => tool.name));
       for (const name of required) assert.equal(names.has(name), true, path + ":" + name);
     }
@@ -94,7 +123,7 @@ test("legacy and scoped endpoints both keep the Music V2 tool surface", async ()
 test("stable widget resource URI is preserved", async () => {
   await withServer(async (base) => {
     for (const path of ["/mcp", "/mcp/music"]) {
-      const body = await rpc(base, path, 4, "resources/list");
+      const body = await successfulRpc(base, path, 6, "resources/list");
       const uris = new Set((body.result?.resources ?? []).map((resource) => resource.uri));
       assert.equal(uris.has("ui://widget/cove-bridge.html"), true, path);
     }
